@@ -1,9 +1,9 @@
 #pragma once
 
-#include <vector>
-#include <array>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
-#include <optional>
+#include <vector>
 
 namespace dx12xpbd
 {
@@ -31,18 +31,35 @@ namespace dx12xpbd
         Vec3 Normalize() const
         {
             const float len = Length();
-            if (len > 1e-6f) return {x / len, y / len, z / len};
+            if (len > 1e-6f)
+            {
+                return {x / len, y / len, z / len};
+            }
             return Zero();
         }
     };
 
     inline Vec3 operator*(float s, const Vec3& v) { return v * s; }
 
+    inline float Dot(const Vec3& a, const Vec3& b)
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    inline Vec3 Cross(const Vec3& a, const Vec3& b)
+    {
+        return {
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x
+        };
+    }
+
     struct Triangle
     {
-        uint32_t i0;
-        uint32_t i1;
-        uint32_t i2;
+        uint32_t i0 = 0;
+        uint32_t i1 = 0;
+        uint32_t i2 = 0;
     };
 
     struct MeshData
@@ -55,9 +72,6 @@ namespace dx12xpbd
     {
         Vec3 center = Vec3::Zero();
         float radius = 0.5f;
-        bool selected = false;
-        bool movable = true;
-        float dragOffset = 0.0f;
     };
 
     struct CapsuleCollider
@@ -65,31 +79,26 @@ namespace dx12xpbd
         Vec3 start = Vec3::Zero();
         Vec3 end = Vec3::Zero();
         float radius = 0.5f;
-        bool selected = false;
-        bool movable = true;
-        Vec3 dragOffset = Vec3::Zero();
     };
 
     struct ClothVertex
     {
-        Vec3 position;
-        Vec3 previousPosition;
-        Vec3 velocity;
+        Vec3 position = Vec3::Zero();
+        Vec3 previousPosition = Vec3::Zero();
+        Vec3 velocity = Vec3::Zero();
         std::vector<uint32_t> neighbors;
     };
 
     struct Constraint
     {
-        uint32_t i0;
-        uint32_t i1;
+        uint32_t i0 = 0;
+        uint32_t i1 = 0;
         float restLength = 0.0f;
     };
 
     class ClothXPBD
     {
     public:
-        ClothXPBD() = default;
-
         void Initialize(const MeshData& mesh, float stiffness = 0.9f);
         void Reset(const MeshData& mesh);
         void Update(float dt,
@@ -113,6 +122,6 @@ namespace dx12xpbd
         void SolveStretchConstraints(float dt, int iterations);
         void ResolveCollisions(const std::vector<SphereCollider>& spheres,
                                const std::vector<CapsuleCollider>& capsules,
-                               float penetrationBias = 0.03f);
+                               float penetrationBias = 0.04f);
     };
 }
