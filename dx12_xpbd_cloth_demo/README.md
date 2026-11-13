@@ -1,38 +1,28 @@
-# DirectX 12 XPBD Cloth Sample
+# DirectX 12 XPBD Cloth Demo
 
-This project is a small DirectX 12 sample that demonstrates:
+This project is a compact DirectX 12 sample that demonstrates a position-based cloth solver with:
 
-- XPBD-based cloth simulation
-- support for arbitrary triangle meshes, not just a fixed grid
-- sphere and capsule collision volumes
-- collider dragging by cursor in the viewport
-
-It is intentionally small and self-contained so that it can be used as a starting point for a larger DX12 simulation project.
-
-## Features
-
-- Any input mesh can be converted into a cloth by supplying vertices and triangle indices.
-- Cloth is solved using a position-based XPBD constraint loop.
-- Sphere and capsule colliders are supported and can be moved with the mouse.
-- Rendering is done with DirectX 12 using a simple unlit shading pipeline.
+- arbitrary triangle mesh input
+- a simple XPBD-style stretch constraint solver
+- sphere and capsule colliders
+- cursor-driven collider dragging in the viewport
 
 ## Build on Windows
 
-Use CMake:
+Use CMake in a Visual Studio 2022 environment:
 
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
 
-Then launch the generated app from `build/Release/dx12_xpbd_cloth_demo.exe`.
+Then run the generated executable from the build output directory.
 
 ## Controls
 
-- Left click: pick a collider and drag it.
-- Right click / drag: move the active collider along the ground plane.
-- Space: reset the cloth.
+- Left mouse drag: move the selected collider
+- Space: reset the cloth
 
 ## Notes
 
-This sample is meant as a practical starting point rather than a full production renderer. The solver is CPU-based, which makes the implementation easier to understand and modify.
+This sample is intentionally small and readable. It is meant as a starting point for a real cloth simulation in DirectX 12 rather than a production renderer.

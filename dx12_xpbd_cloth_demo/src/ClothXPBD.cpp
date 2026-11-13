@@ -2,37 +2,17 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
+#include <vector>
 
 namespace dx12xpbd
 {
     namespace
     {
-        inline float Dot(const Vec3& a, const Vec3& b)
-        {
-            return a.x * b.x + a.y * b.y + a.z * b.z;
-        }
-
-        inline Vec3 Cross(const Vec3& a, const Vec3& b)
-        {
-            return {
-                a.y * b.z - a.z * b.y,
-                a.z * b.x - a.x * b.z,
-                a.x * b.y - a.y * b.x
-            };
-        }
-
-        inline Vec3 Normalize(const Vec3& v)
-        {
-            const float len = v.Length();
-            if (len > 1e-6f)\n                return v / len;
-            return Vec3::Zero();
-        }
-
-        inline Vec3 ClosestPointOnSegment(const Vec3& p, const Vec3& a, const Vec3& b)
+        Vec3 ClosestPointOnSegment(const Vec3& p, const Vec3& a, const Vec3& b)
         {
             const Vec3 ab = b - a;
-            const float t = std::clamp(Dot(p - a, ab) / std::max(Dot(ab, ab), 1e-6f), 0.0f, 1.0f);
+            const float denom = Dot(ab, ab);
+            const float t = (denom > 1e-6f) ? std::clamp(Dot(p - a, ab) / denom, 0.0f, 1.0f) : 0.0f;
             return a + ab * t;
         }
     }
@@ -59,7 +39,10 @@ namespace dx12xpbd
 
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
         {
-            triangles_.push_back({mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2]});
+            const uint32_t i0 = mesh.indices[i];
+            const uint32_t i1 = mesh.indices[i + 1];
+            const uint32_t i2 = mesh.indices[i + 2];
+            triangles_.push_back({i0, i1, i2});
         }
 
         BuildConstraints();
@@ -80,21 +63,24 @@ namespace dx12xpbd
 
         for (size_t i = 0; i < vertices_.size(); ++i)
         {
-            auto& neigh = vertices_[i].neighbors;
-            neigh.clear();
+            auto& neighbors = vertices_[i].neighbors;
+            neighbors.clear();
             std::sort(adjacency[i].begin(), adjacency[i].end());
-            neigh.insert(neigh.end(), adjacency[i].begin(), adjacency[i].end());
-            neigh.erase(std::unique(neigh.begin(), neigh.end()), neigh.end());
+            neighbors.insert(neighbors.end(), adjacency[i].begin(), adjacency[i].end());
+            neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
         }
 
-        std::vector<bool> visited(vertices_.size(), false);
         for (size_t i = 0; i < vertices_.size(); ++i)
         {
             for (uint32_t j : vertices_[i].neighbors)
             {
-                if (j <= i) continue;
-                const float rest = (vertices_[i].position - vertices_[j].position).Length();
-                constraints_.push_back({static_cast<uint32_t>(i), j, rest});
+                if (j <= i)
+                {
+                    continue;
+                }
+
+                const float restLength = (vertices_[i].position - vertices_[j].position).Length();
+                constraints_.push_back({static_cast<uint32_t>(i), j, restLength});
             }
         }
 
@@ -103,34 +89,43 @@ namespace dx12xpbd
             const auto& a = vertices_[tri.i0].position;
             const auto& b = vertices_[tri.i1].position;
             const auto& c = vertices_[tri.i2].position;
+
             const float ab = (a - b).Length();
             const float bc = (b - c).Length();
             const float ca = (c - a).Length();
 
-            if (ab > 1e-4f)
-                constraints_.push_back({tri.i0, tri.i1, ab});
-            if (bc > 1e-4f)
-                constraints_.push_back({tri.i1, tri.i2, bc});
-            if (ca > 1e-4f)
-                constraints_.push_back({tri.i2, tri.i0, ca});
+            if (ab > 1e-4f) constraints_.push_back({tri.i0, tri.i1, ab});
+            if (bc > 1e-4f) constraints_.push_back({tri.i1, tri.i2, bc});
+            if (ca > 1e-4f) constraints_.push_back({tri.i2, tri.i0, ca});
         }
     }
 
     void ClothXPBD::SolveStretchConstraints(float dt, int iterations)
     {
+        (void)dt;
+
         for (int iter = 0; iter < iterations; ++iter)
         {
             for (const auto& c : constraints_)
             {
+                if (c.i0 >= vertices_.size() || c.i1 >= vertices_.size())
+                {
+                    continue;
+                }
+
                 auto& p0 = vertices_[c.i0].position;
                 auto& p1 = vertices_[c.i1].position;
                 const Vec3 delta = p1 - p0;
                 const float dist = delta.Length();
-                if (dist < 1e-6f) continue;
+                if (dist < 1e-6f)
+                {
+                    continue;
+                }
 
-                const float diff = (dist - c.restLength) * stiffness_;
                 const Vec3 n = delta / dist;
-                const Vec3 correction = n * (diff * 0.5f);
+                const float error = dist - c.restLength;
+                const float correctionFactor = stiffness_ * 0.5f;
+                const Vec3 correction = n * (error * correctionFactor);
 
                 p0 += correction;
                 p1 -= correction;
@@ -146,25 +141,25 @@ namespace dx12xpbd
         {
             for (const auto& sphere : spheres)
             {
-                const Vec3 toVertex = v.position - sphere.center;
-                const float dist = toVertex.Length();
+                const Vec3 delta = v.position - sphere.center;
+                const float dist = delta.Length();
                 const float minDist = sphere.radius + penetrationBias;
                 if (dist < minDist)
                 {
-                    const Vec3 normal = Normalize(toVertex);
+                    const Vec3 normal = (dist > 1e-6f) ? (delta / dist) : Vec3{0.0f, 1.0f, 0.0f};
                     v.position = sphere.center + normal * minDist;
                 }
             }
 
-            for (const auto& cap : capsules)
+            for (const auto& capsule : capsules)
             {
-                const Vec3 closest = ClosestPointOnSegment(v.position, cap.start, cap.end);
+                const Vec3 closest = ClosestPointOnSegment(v.position, capsule.start, capsule.end);
                 const Vec3 delta = v.position - closest;
                 const float dist = delta.Length();
-                const float minDist = cap.radius + penetrationBias;
+                const float minDist = capsule.radius + penetrationBias;
                 if (dist < minDist)
                 {
-                    const Vec3 normal = Normalize(delta);
+                    const Vec3 normal = (dist > 1e-6f) ? (delta / dist) : Vec3{0.0f, 1.0f, 0.0f};
                     v.position = closest + normal * minDist;
                 }
             }
@@ -178,14 +173,16 @@ namespace dx12xpbd
                           int iterations,
                           float damping)
     {
-        if (dt <= 0.0f) return;
+        if (dt <= 0.0f)
+        {
+            return;
+        }
 
         for (auto& v : vertices_)
         {
-            const Vec3 vel = (v.position - v.previousPosition) * damping;
+            const Vec3 predicted = v.position + (v.position - v.previousPosition) * damping + gravity * dt * dt;
             v.previousPosition = v.position;
-            v.velocity = vel + gravity * dt * dt;
-            v.position += v.velocity;
+            v.position = predicted;
         }
 
         SolveStretchConstraints(dt, iterations);
@@ -197,7 +194,9 @@ namespace dx12xpbd
         std::vector<Vec3> out;
         out.reserve(vertices_.size());
         for (const auto& v : vertices_)
+        {
             out.push_back(v.position);
+        }
         return out;
     }
 }

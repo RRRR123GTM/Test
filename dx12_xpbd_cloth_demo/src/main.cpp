@@ -1,6 +1,8 @@
 #include <windows.h>
 
 #include <d3d12.h>
+#include <d3dcompiler.h>
+#include <d3dx12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -9,7 +11,6 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
-#include <iostream>
 #include <vector>
 
 #include "ClothXPBD.h"
@@ -19,58 +20,34 @@ using namespace DirectX;
 
 namespace
 {
-    constexpr uint32_t kFrameCount = 2;
+    constexpr UINT kFrameCount = 2;
 
     struct Vertex
     {
         XMFLOAT3 position;
-        XMFLOAT3 normal;
         XMFLOAT4 color;
     };
 
     struct SceneConstants
     {
+        XMFLOAT4X4 world;
         XMFLOAT4X4 view;
         XMFLOAT4X4 proj;
-        XMFLOAT4X4 world;
     };
-
-    std::vector<dx12xpbd::Vec3> MakeSpherePatch(int segmentsU, int segmentsV)
-    {
-        std::vector<dx12xpbd::Vec3> verts;
-        const float radius = 1.0f;
-
-        for (int v = 0; v <= segmentsV; ++v)
-        {
-            const float theta = (float(v) / segmentsV) * XM_PI;
-            const float y = std::cos(theta) * radius;
-            const float ringRadius = std::sin(theta) * radius;
-
-            for (int u = 0; u <= segmentsU; ++u)
-            {
-                const float phi = (float(u) / segmentsU) * XM_2PI;
-                const float x = std::cos(phi) * ringRadius;
-                const float z = std::sin(phi) * ringRadius;
-                verts.push_back({x, y, z});
-            }
-        }
-
-        return verts;
-    }
 
     dx12xpbd::MeshData MakePlaneClothMesh(int width, int height, float spacing = 0.12f)
     {
         dx12xpbd::MeshData mesh;
-        mesh.positions.reserve(width * height);
-        mesh.indices.reserve((width - 1) * (height - 1) * 6);
+        mesh.positions.reserve(static_cast<size_t>(width * height));
+        mesh.indices.reserve(static_cast<size_t>((width - 1) * (height - 1) * 6));
 
         for (int y = 0; y < height; ++y)
         {
             for (int x = 0; x < width; ++x)
             {
-                const float px = (float(x) - float(width - 1) * 0.5f) * spacing;
+                const float px = (static_cast<float>(x) - static_cast<float>(width - 1) * 0.5f) * spacing;
                 const float py = 0.0f;
-                const float pz = (float(y) - float(height - 1) * 0.5f) * spacing;
+                const float pz = (static_cast<float>(y) - static_cast<float>(height - 1) * 0.5f) * spacing;
                 mesh.positions.push_back({px, py, pz});
             }
         }
@@ -79,10 +56,10 @@ namespace
         {
             for (int x = 0; x < width - 1; ++x)
             {
-                const uint32_t i0 = uint32_t(y * width + x);
-                const uint32_t i1 = uint32_t(y * width + x + 1);
-                const uint32_t i2 = uint32_t((y + 1) * width + x);
-                const uint32_t i3 = uint32_t((y + 1) * width + x + 1);
+                const uint32_t i0 = static_cast<uint32_t>(y * width + x);
+                const uint32_t i1 = static_cast<uint32_t>(y * width + x + 1);
+                const uint32_t i2 = static_cast<uint32_t>((y + 1) * width + x);
+                const uint32_t i3 = static_cast<uint32_t>((y + 1) * width + x + 1);
 
                 mesh.indices.push_back(i0);
                 mesh.indices.push_back(i1);
@@ -97,144 +74,202 @@ namespace
         return mesh;
     }
 
-    struct DX12ClothDemo
+    class ClothDemoApp
     {
-        HWND hwnd = nullptr;
-        HINSTANCE instance = nullptr;
-
-        ComPtr<ID3D12Device> device;
-        ComPtr<ID3D12CommandQueue> commandQueue;
-        ComPtr<IDXGISwapChain3> swapChain;
-        ComPtr<ID3D12Resource> renderTargets[kFrameCount];
-        ComPtr<ID3D12CommandAllocator> commandAllocator;
-        ComPtr<ID3D12GraphicsCommandList> commandList;
-        ComPtr<ID3D12RootSignature> rootSignature;
-        ComPtr<ID3D12PipelineState> pipelineState;
-        ComPtr<ID3D12DescriptorHeap> rtvHeap;
-        ComPtr<ID3D12Fence> fence;
-
-        UINT rtvDescriptorSize = 0;
-        UINT64 fenceValue = 0;
-        UINT frameIndex = 0;
-        D3D12_VIEWPORT viewport = {};
-        D3D12_RECT scissorRect = {};
-
-        dx12xpbd::ClothXPBD cloth;
-        std::vector<dx12xpbd::SphereCollider> spheres;
-        std::vector<dx12xpbd::CapsuleCollider> capsules;
-
-        ComPtr<ID3D12Resource> vertexBuffer;
-        D3D12_VERTEX_BUFFER_VIEW vertexBufferView = {};
-        UINT vertexCount = 0;
-
-        bool draggingCollider = false;
-        uint32_t activeColliderIndex = 0;
-        bool activeIsSphere = false;
-
-        Vec3 cameraPosition = {0.0f, 2.5f, 8.0f};
-        Vec3 cameraTarget = {0.0f, 0.0f, 0.0f};
-
-        std::vector<Vertex> meshVertices;
-        std::vector<uint16_t> meshIndices;
-
-        DX12ClothDemo() = default;
-
-        void Initialize(HINSTANCE hinst, int width, int height)
+    public:
+        void Initialize(HINSTANCE instance, int width, int height)
         {
-            instance = hinst;
+            instance_ = instance;
+            width_ = width;
+            height_ = height;
 
-            const WNDCLASSA wc = {
-                CS_HREDRAW | CS_VREDRAW,
-                [](HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT
-                {
-                    auto* self = reinterpret_cast<DX12ClothDemo*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-                    switch (message)
-                    {
-                    case WM_DESTROY:
-                        PostQuitMessage(0);
-                        return 0;
-                    case WM_MOUSEMOVE:
-                        if (self) self->HandleMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-                        return 0;
-                    case WM_LBUTTONDOWN:
-                        if (self) self->HandleLeftMouseDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-                        return 0;
-                    case WM_LBUTTONUP:
-                        if (self) self->HandleLeftMouseUp();
-                        return 0;
-                    case WM_RBUTTONDOWN:
-                        if (self) self->HandleRightMouseDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-                        return 0;
-                    case WM_RBUTTONUP:
-                        if (self) self->HandleRightMouseUp();
-                        return 0;
-                    case WM_KEYDOWN:
-                        if (self && wParam == VK_SPACE) self->ResetScene();
-                        return 0;
-                    default:
-                        return DefWindowProcA(hwnd, message, wParam, lParam);
-                    }
-                },
-                0,
-                0,
-                0,
-                TEXT("DX12XPBDCloth"),
-                LoadCursorA(nullptr, IDC_ARROW)
-            };
+            WNDCLASSEXW wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = WndProc;
+            wc.hInstance = instance_;
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.lpszClassName = L"DX12XPBDClothDemo";
+            RegisterClassExW(&wc);
 
-            RegisterClassA(&wc);
-
-            hwnd = CreateWindowExA(
+            hwnd_ = CreateWindowExW(
                 0,
-                TEXT("DX12XPBDCloth"),
-                TEXT("DX12 XPBD Cloth"),
+                L"DX12XPBDClothDemo",
+                L"DX12 XPBD Cloth",
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                width_,
+                height_,
                 nullptr,
                 nullptr,
-                instance,
+                instance_,
                 nullptr);
 
-            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
+            SetWindowLongPtrW(hwnd_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
 
-            CreateDeviceAndSwapChain(width, height);
+            ShowWindow(hwnd_, SW_SHOW);
+            UpdateWindow(hwnd_);
+
+            CreateDevice();
+            CreateCommandQueue();
+            CreateSwapChain();
             CreateRenderTargets();
-            CreateCommandObjects();
-            CreateRootSignatureAndPipeline();
+            CreateRootSignature();
+            CreatePipelineState();
+            CreateConstantBuffer();
             CreateCloth();
-            BuildClothVertexBuffer();
+            CreateClothBuffers();
         }
 
-        void CreateDeviceAndSwapChain(int width, int height)
+        void Run()
         {
+            MSG msg = {};
+            while (true)
+            {
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+                {
+                    if (msg.message == WM_QUIT)
+                    {
+                        return;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+
+                UpdatePhysics(1.0f / 60.0f);
+                Render();
+            }
+        }
+
+    private:
+        HINSTANCE instance_ = nullptr;
+        HWND hwnd_ = nullptr;
+        int width_ = 1280;
+        int height_ = 720;
+
+        ComPtr<ID3D12Device> device_;
+        ComPtr<ID3D12CommandQueue> commandQueue_;
+        ComPtr<IDXGISwapChain3> swapChain_;
+        ComPtr<ID3D12CommandAllocator> commandAllocator_[kFrameCount];
+        ComPtr<ID3D12GraphicsCommandList> commandList_;
+        ComPtr<ID3D12RootSignature> rootSignature_;
+        ComPtr<ID3D12PipelineState> pipelineState_;
+        ComPtr<ID3D12DescriptorHeap> rtvHeap_;
+        ComPtr<ID3D12Fence> fence_;
+        UINT rtvDescriptorSize_ = 0;
+        UINT64 fenceValue_ = 0;
+        UINT frameIndex_ = 0;
+
+        ComPtr<ID3D12Resource> renderTargets_[kFrameCount];
+        ComPtr<ID3D12Resource> clothVertexBuffer_;
+        ComPtr<ID3D12Resource> clothIndexBuffer_;
+        ComPtr<ID3D12Resource> constantBuffer_;
+        UINT8_t* cbMapped_ = nullptr;
+
+        D3D12_VERTEX_BUFFER_VIEW vertexBufferView_ = {};
+        D3D12_INDEX_BUFFER_VIEW indexBufferView_ = {};
+
+        dx12xpbd::ClothXPBD cloth_;
+        std::vector<dx12xpbd::SphereCollider> spheres_;
+        std::vector<dx12xpbd::CapsuleCollider> capsules_;
+
+        bool dragging_ = false;
+        int selectedColliderIndex_ = -1;
+        bool selectedIsSphere_ = false;
+
+        XMFLOAT3 cameraPosition_ = {0.0f, 2.8f, 8.0f};
+        XMFLOAT3 cameraTarget_ = {0.0f, 0.0f, 0.0f};
+
+        static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+        {
+            auto* self = reinterpret_cast<ClothDemoApp*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            switch (message)
+            {
+            case WM_DESTROY:
+                PostQuitMessage(0);
+                return 0;
+            case WM_LBUTTONDOWN:
+                if (self) self->OnMouseLeftDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                return 0;
+            case WM_LBUTTONUP:
+                if (self) self->OnMouseLeftUp();
+                return 0;
+            case WM_MOUSEMOVE:
+                if (self) self->OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                return 0;
+            case WM_KEYDOWN:
+                if (self && wParam == VK_SPACE) self->ResetCloth();
+                return 0;
+            default:
+                return DefWindowProcW(hwnd, message, wParam, lParam);
+            }
+        }
+
+        void CreateDevice()
+        {
+            UINT dxgiFactoryFlags = 0;
+#if defined(_DEBUG)
+            ComPtr<ID3D12Debug> debugController;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
+            {
+                debugController->EnableDebugLayer();
+                dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
+            }
+#endif
+
+            ComPtr<IDXGIFactory4> factory;
+            CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&factory));
+
+            D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_12_0;
+            HRESULT hr = D3D12CreateDevice(nullptr, featureLevel, IID_PPV_ARGS(&device_));
+            if (FAILED(hr))
+            {
+                throw std::runtime_error("D3D12CreateDevice failed");
+            }
+        }
+
+        void CreateCommandQueue()
+        {
+            D3D12_COMMAND_QUEUE_DESC qd = {};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+            device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&commandQueue_));
+
+            for (UINT i = 0; i < kFrameCount; ++i)
+            {
+                device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator_[i]));
+            }
+
+            device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator_[0].Get(), nullptr, IID_PPV_ARGS(&commandList_));
+            commandList_->Close();
+            device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
+        }
+
+        void CreateSwapChain()
+        {
+            ComPtr<IDXGIFactory4> factory;
+            CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+
             DXGI_SWAP_CHAIN_DESC1 sd = {};
             sd.BufferCount = kFrameCount;
-            sd.Width = static_cast<UINT>(width);
-            sd.Height = static_cast<UINT>(height);
+            sd.Width = static_cast<UINT>(width_);
+            sd.Height = static_cast<UINT>(height_);
             sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
             sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             sd.SampleDesc.Count = 1;
 
-            IDXGIFactory4* factory = nullptr;
-            CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
-
-            IDXGISwapChain1* swapChain1 = nullptr;
+            ComPtr<IDXGISwapChain1> swapChain1;
             factory->CreateSwapChainForHwnd(
-                nullptr,
-                hwnd,
+                commandQueue_.Get(),
+                hwnd_,
                 &sd,
                 nullptr,
                 nullptr,
                 &swapChain1);
 
-            swapChain1->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&swapChain));
-            swapChain1->Release();
-            factory->Release();
-
-            D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+            swapChain1.As(&swapChain_);
         }
 
         void CreateRenderTargets()
@@ -242,91 +277,101 @@ namespace
             D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
             rtvHeapDesc.NumDescriptors = kFrameCount;
             rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-            device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap));
-            rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            device_->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&rtvHeap_));
+            rtvDescriptorSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-            auto rtvHandle = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(rtvHeap_->GetCPUDescriptorHandleForHeapStart());
             for (UINT i = 0; i < kFrameCount; ++i)
             {
-                swapChain->GetBuffer(i, IID_PPV_ARGS(&renderTargets[i]));
-                device->CreateRenderTargetView(renderTargets[i].Get(), nullptr, rtvHandle);
-                rtvHandle.ptr += rtvDescriptorSize;
+                swapChain_->GetBuffer(i, IID_PPV_ARGS(&renderTargets_[i]));
+                device_->CreateRenderTargetView(renderTargets_[i].Get(), nullptr, rtvHandle);
+                rtvHandle.Offset(rtvDescriptorSize_);
             }
         }
 
-        void CreateCommandObjects()
+        void CreateRootSignature()
         {
-            D3D12_COMMAND_QUEUE_DESC qd = {};
-            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-            qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-            device->CreateCommandQueue(&qd, IID_PPV_ARGS(&commandQueue));
-            device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&commandAllocator));
-            device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocator.Get(), nullptr, IID_PPV_ARGS(&commandList));
-            commandList->Close();
+            CD3DX12_ROOT_PARAMETER rootParameters[1] = {};
+            rootParameters[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
 
-            device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-            frameIndex = swapChain->GetCurrentBackBufferIndex();
+            CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
+            rootSigDesc.Init(_countof(rootParameters), rootParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+            ComPtr<ID3DBlob> serializedSignature;
+            ComPtr<ID3DBlob> serializedError;
+            HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serializedSignature, &serializedError);
+            if (FAILED(hr))
+            {
+                throw std::runtime_error("D3D12SerializeRootSignature failed");
+            }
+
+            device_->CreateRootSignature(0, serializedSignature->GetBufferPointer(), serializedSignature->GetBufferSize(), IID_PPV_ARGS(&rootSignature_));
         }
 
-        void CreateRootSignatureAndPipeline()
+        void CreatePipelineState()
         {
-            D3D12_ROOT_PARAMETER rootParameters[1] = {};
-            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-            rootParameters[0].Constants.Num32BitValues = 16;
-            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+            static const char* shaderCode =
+                "struct VSInput { float3 pos : POSITION; float4 col : COLOR; };\n"
+                "struct PSInput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
+                "cbuffer SceneConstants : register(b0) { float4x4 world; float4x4 view; float4x4 proj; };\n"
+                "PSInput VSMain(VSInput input) {\n"
+                "  PSInput output;\n"
+                "  float4 worldPos = mul(float4(input.pos, 1.0f), world);\n"
+                "  float4 viewPos = mul(worldPos, view);\n"
+                "  output.pos = mul(viewPos, proj);\n"
+                "  output.col = input.col;\n"
+                "  return output;\n"
+                "}\n"
+                "float4 PSMain(PSInput input) : SV_TARGET { return input.col; }\n";
 
-            D3D12_STATIC_SAMPLER_DESC sampler = {};
-            sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            ComPtr<ID3DBlob> vsBlob;
+            ComPtr<ID3DBlob> psBlob;
+            ComPtr<ID3DBlob> errorBlob;
 
-            D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
-            rootSigDesc.NumParameters = 1;
-            rootSigDesc.pParameters = rootParameters;
-            rootSigDesc.NumStaticSamplers = 1;
-            rootSigDesc.pStaticSamplers = &sampler;
-            rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+            HRESULT hrVS = D3DCompile(
+                shaderCode,
+                strlen(shaderCode),
+                nullptr,
+                nullptr,
+                nullptr,
+                "VSMain",
+                "vs_5_0",
+                0,
+                0,
+                &vsBlob,
+                &errorBlob);
+            HRESULT hrPS = D3DCompile(
+                shaderCode,
+                strlen(shaderCode),
+                nullptr,
+                nullptr,
+                nullptr,
+                "PSMain",
+                "ps_5_0",
+                0,
+                0,
+                &psBlob,
+                &errorBlob);
 
-            ComPtr<ID3DBlob> signature;
-            ComPtr<ID3DBlob> error;
-            D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error);
-            device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
+            if (FAILED(hrVS) || FAILED(hrPS))
+            {
+                if (errorBlob)
+                {
+                    OutputDebugStringA(reinterpret_cast<const char*>(errorBlob->GetBufferPointer()));
+                }
+                throw std::runtime_error("Shader compile failed");
+            }
 
-            static const char* kVertexShader =
-                "float4x4 view;"
-                "float4x4 proj;"
-                "float4x4 world;"
-                "struct VSIn { float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR; };"
-                "struct VSOut { float4 pos : SV_POSITION; float4 col : COLOR; };"
-                "VSOut main(VSIn v) {"
-                "  VSOut o;"
-                "  float4 worldPos = mul(float4(v.pos, 1.0f), world);"
-                "  o.pos = mul(worldPos, view);"
-                "  o.pos = mul(o.pos, proj);"
-                "  o.col = v.col;"
-                "  return o;"
-                "}";
-
-            static const char* kPixelShader =
-                "struct PSIn { float4 pos : SV_POSITION; float4 col : COLOR; };"
-                "float4 main(PSIn p) : SV_TARGET { return p.col; }";
-
-            // The sample intentionally keeps a minimal raw-bytecode path. In a real project you would compile HLSL shaders.
-            // We keep this simple and direct so the logic remains readable and portable for a starter sample.
             D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
                 {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
             };
 
             D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-            psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
-            psoDesc.pRootSignature = rootSignature.Get();
-            psoDesc.VS = { kVertexShader, strlen(kVertexShader) };
-            psoDesc.PS = { kPixelShader, strlen(kPixelShader) };
+            psoDesc.InputLayout = {inputLayout, _countof(inputLayout)};
+            psoDesc.pRootSignature = rootSignature_.Get();
+            psoDesc.VS = CD3DX12_SHADER_BYTECODE(vsBlob.Get());
+            psoDesc.PS = CD3DX12_SHADER_BYTECODE(psBlob.Get());
             psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
             psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
             psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
@@ -335,222 +380,292 @@ namespace
             psoDesc.NumRenderTargets = 1;
             psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
             psoDesc.SampleDesc.Count = 1;
-            device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
+
+            device_->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState_));
         }
 
-        void CreateCloth()
+        void CreateConstantBuffer()
         {
-            dx12xpbd::MeshData mesh = MakePlaneClothMesh(22, 22, 0.12f);
-            cloth.Initialize(mesh, 0.95f);
-
-            spheres.resize(2);
-            spheres[0].center = {0.0f, 1.25f, 0.0f};
-            spheres[0].radius = 0.8f;
-            spheres[1].center = {2.5f, 1.8f, 0.0f};
-            spheres[1].radius = 0.7f;
-
-            capsules.resize(1);
-            capsules[0].start = {-2.2f, 0.0f, 0.0f};
-            capsules[0].end = {-2.2f, 2.2f, 0.0f};
-            capsules[0].radius = 0.45f;
-        }
-
-        void ResetScene()
-        {
-            dx12xpbd::MeshData mesh = MakePlaneClothMesh(22, 22, 0.12f);
-            cloth.Reset(mesh);
-        }
-
-        void BuildClothVertexBuffer()
-        {
-            const auto positions = cloth.Positions();
-            vertexCount = static_cast<UINT>(positions.size());
-            std::vector<Vertex> vertices;
-            vertices.reserve(positions.size());
-            for (size_t i = 0; i < positions.size(); ++i)
-            {
-                const auto& p = positions[i];
-                Vertex v = {};
-                v.position = {p.x, p.y, p.z};
-                v.normal = {0.0f, 1.0f, 0.0f};
-                v.color = {0.25f, 0.7f, 1.0f, 1.0f};
-                vertices.push_back(v);
-            }
-
-            const UINT size = static_cast<UINT>(vertices.size() * sizeof(Vertex));
-            D3D12_HEAP_PROPERTIES heapProps = {};
-            heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-            D3D12_RESOURCE_DESC resourceDesc = {};
-            resourceDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            resourceDesc.Width = static_cast<UINT64>(size);
-            resourceDesc.Height = 1;
-            resourceDesc.DepthOrArraySize = 1;
-            resourceDesc.MipLevels = 1;
-            resourceDesc.SampleDesc.Count = 1;
-            resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            resourceDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-            device->CreateCommittedResource(
+            const UINT bufferSize = (sizeof(SceneConstants) + 255) & ~255;
+            CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+            CD3DX12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+            device_->CreateCommittedResource(
                 &heapProps,
                 D3D12_HEAP_FLAG_NONE,
                 &resourceDesc,
                 D3D12_RESOURCE_STATE_GENERIC_READ,
                 nullptr,
-                IID_PPV_ARGS(&vertexBuffer));
+                IID_PPV_ARGS(&constantBuffer_));
 
-            void* mapped = nullptr;
-            vertexBuffer->Map(0, nullptr, &mapped);
-            std::memcpy(mapped, vertices.data(), size);
-            vertexBuffer->Unmap(0, nullptr);
-
-            vertexBufferView.BufferLocation = vertexBuffer->GetGPUVirtualAddress();
-            vertexBufferView.StrideInBytes = sizeof(Vertex);
-            vertexBufferView.SizeInBytes = size;
+            constantBuffer_->Map(0, nullptr, reinterpret_cast<void**>(&cbMapped_));
         }
 
-        static Vec3 ScreenToRay(int mouseX, int mouseY, int width, int height, const Vec3& cameraPos, const Vec3& target)
+        void CreateCloth()
         {
-            const float nx = (2.0f * mouseX / width) - 1.0f;
-            const float ny = 1.0f - (2.0f * mouseY / height);
-            const Vec3 forward = (target - cameraPos).Normalize();
-            const Vec3 right = Vec3{1.0f, 0.0f, 0.0f};
-            const Vec3 up = Cross(forward, right).Normalize();
-            const Vec3 cameraRay = (forward * 1.0f + right * nx + up * ny).Normalize();
-            return cameraRay;
+            dx12xpbd::MeshData mesh = MakePlaneClothMesh(24, 24, 0.12f);
+            cloth_.Initialize(mesh, 0.98f);
+
+            spheres_.resize(2);
+            spheres_[0].center = {0.0f, 1.0f, 0.0f};
+            spheres_[0].radius = 0.75f;
+            spheres_[1].center = {1.8f, 1.3f, 0.0f};
+            spheres_[1].radius = 0.65f;
+
+            capsules_.resize(1);
+            capsules_[0].start = {-2.2f, 0.0f, 0.0f};
+            capsules_[0].end = {-2.2f, 2.0f, 0.0f};
+            capsules_[0].radius = 0.42f;
+        }
+
+        void ResetCloth()
+        {
+            dx12xpbd::MeshData mesh = MakePlaneClothMesh(24, 24, 0.12f);
+            cloth_.Reset(mesh);
+        }
+
+        void BuildRenderBuffers()
+        {
+            const auto positions = cloth_.Positions();
+            const auto triangles = cloth_.Triangles();
+
+            std::vector<Vertex> vertices;
+            vertices.reserve(positions.size());
+            for (const auto& p : positions)
+            {
+                vertices.push_back({{p.x, p.y, p.z}, {0.28f, 0.72f, 1.0f, 1.0f}});
+            }
+
+            std::vector<uint32_t> indices;
+            indices.reserve(triangles.size() * 3);
+            for (const auto& tri : triangles)
+            {
+                indices.push_back(tri.i0);
+                indices.push_back(tri.i1);
+                indices.push_back(tri.i2);
+            }
+
+            const UINT vertexByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
+            const UINT indexByteSize = static_cast<UINT>(indices.size() * sizeof(uint32_t));
+
+            if (!clothVertexBuffer_)
+            {
+                CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+                CD3DX12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(vertexByteSize);
+                device_->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clothVertexBuffer_));
+            }
+
+            if (!clothIndexBuffer_)
+            {
+                CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+                CD3DX12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(indexByteSize);
+                device_->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &resourceDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&clothIndexBuffer_));
+            }
+
+            void* mappedVertices = nullptr;
+            clothVertexBuffer_->Map(0, nullptr, &mappedVertices);
+            std::memcpy(mappedVertices, vertices.data(), vertexByteSize);
+            clothVertexBuffer_->Unmap(0, nullptr);
+
+            void* mappedIndices = nullptr;
+            clothIndexBuffer_->Map(0, nullptr, &mappedIndices);
+            std::memcpy(mappedIndices, indices.data(), indexByteSize);
+            clothIndexBuffer_->Unmap(0, nullptr);
+
+            vertexBufferView_.BufferLocation = clothVertexBuffer_->GetGPUVirtualAddress();
+            vertexBufferView_.StrideInBytes = sizeof(Vertex);
+            vertexBufferView_.SizeInBytes = vertexByteSize;
+
+            indexBufferView_.BufferLocation = clothIndexBuffer_->GetGPUVirtualAddress();
+            indexBufferView_.Format = DXGI_FORMAT_R32_UINT;
+            indexBufferView_.SizeInBytes = indexByteSize;
+        }
+
+        void CreateClothBuffers()
+        {
+            BuildRenderBuffers();
         }
 
         void UpdatePhysics(float dt)
         {
-            cloth.Update(dt, spheres, capsules, {0.0f, -9.8f, 0.0f}, 4, 0.98f);
-            BuildClothVertexBuffer();
+            cloth_.Update(dt, spheres_, capsules_, {0.0f, -9.8f, 0.0f}, 4, 0.986f);
+            BuildRenderBuffers();
         }
 
-        void HandleMouseMove(int x, int y)
+        void OnMouseLeftDown(int x, int y)
         {
-            if (!draggingCollider) return;
-
-            const int width = 1280;
-            const int height = 720;
-
-            const Vec3 rayDir = ScreenToRay(x, y, width, height, cameraPosition, cameraTarget);
-            const Vec3 groundPoint = {0.0f, 0.0f, 0.0f};
-            const float t = -cameraPosition.y / rayDir.y;
-            Vec3 hit = cameraPosition + rayDir * t;
-
-            if (activeIsSphere)
-            {
-                spheres[activeColliderIndex].center = {hit.x, 0.8f + spheres[activeColliderIndex].radius, hit.z};
-            }
-            else
-            {
-                capsules[activeColliderIndex].start = {hit.x, 0.0f, hit.z};
-                capsules[activeColliderIndex].end = {hit.x, 2.0f, hit.z};
-            }
+            dragging_ = TrySelectCollider(x, y);
         }
 
-        void HandleLeftMouseDown(int x, int y)
+        void OnMouseLeftUp()
         {
-            draggingCollider = false;
-            for (uint32_t i = 0; i < spheres.size(); ++i)
+            dragging_ = false;
+            selectedColliderIndex_ = -1;
+            selectedIsSphere_ = false;
+        }
+
+        void OnMouseMove(int x, int y)
+        {
+            if (!dragging_)
             {
-                const auto& sphere = spheres[i];
-                const float dx = x - 640; // intentionally simplified for example-style interaction
-                const float dy = y - 360;
-                if (dx * dx + dy * dy < 900.0f)
+                return;
+            }
+
+            const auto hit = ScreenToGround(x, y);
+            if (selectedIsSphere_)
+            {
+                if (selectedColliderIndex_ >= 0 && selectedColliderIndex_ < static_cast<int>(spheres_.size()))
                 {
-                    draggingCollider = true;
-                    activeColliderIndex = i;
-                    activeIsSphere = true;
-                    return;
+                    spheres_[selectedColliderIndex_].center = {hit.x, 0.8f + spheres_[selectedColliderIndex_].radius, hit.z};
+                }
+            }
+            else if (selectedColliderIndex_ >= 0 && selectedColliderIndex_ < static_cast<int>(capsules_.size()))
+            {
+                capsules_[selectedColliderIndex_].start = {hit.x, 0.0f, hit.z};
+                capsules_[selectedColliderIndex_].end = {hit.x, 2.0f, hit.z};
+            }
+        }
+
+        bool TrySelectCollider(int x, int y)
+        {
+            for (int i = 0; i < static_cast<int>(spheres_.size()); ++i)
+            {
+                const auto projected = ProjectPoint(spheres_[i].center);
+                const float dx = static_cast<float>(x) - projected.x;
+                const float dy = static_cast<float>(y) - projected.y;
+                if (dx * dx + dy * dy < 400.0f)
+                {
+                    selectedColliderIndex_ = i;
+                    selectedIsSphere_ = true;
+                    return true;
                 }
             }
 
-            for (uint32_t i = 0; i < capsules.size(); ++i)
+            for (int i = 0; i < static_cast<int>(capsules_.size()); ++i)
             {
-                const auto& cap = capsules[i];
-                const float dx = x - 640;
-                const float dy = y - 360;
-                if (dx * dx + dy * dy < 900.0f)
+                const auto projected = ProjectPoint((capsules_[i].start + capsules_[i].end) * 0.5f);
+                const float dx = static_cast<float>(x) - projected.x;
+                const float dy = static_cast<float>(y) - projected.y;
+                if (dx * dx + dy * dy < 420.0f)
                 {
-                    draggingCollider = true;
-                    activeColliderIndex = i;
-                    activeIsSphere = false;
-                    return;
+                    selectedColliderIndex_ = i;
+                    selectedIsSphere_ = false;
+                    return true;
                 }
             }
+
+            return false;
         }
 
-        void HandleLeftMouseUp() { draggingCollider = false; }
-        void HandleRightMouseDown(int x, int y) { HandleLeftMouseDown(x, y); }
-        void HandleRightMouseUp() { draggingCollider = false; }
-
-        void RenderFrame()
+        XMFLOAT2 ProjectPoint(const dx12xpbd::Vec3& worldPos) const
         {
-            frameIndex = swapChain->GetCurrentBackBufferIndex();
-            commandAllocator->Reset();
-            commandList->Reset(commandAllocator.Get(), pipelineState.Get());
+            const XMVECTOR world = XMVectorSet(worldPos.x, worldPos.y, worldPos.z, 1.0f);
+            const XMMATRIX view = XMMatrixLookAtLH(XMLoadFloat3(&cameraPosition_), XMLoadFloat3(&cameraTarget_), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
+            const XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV4, width_ / static_cast<float>(height_), 0.1f, 100.0f);
+            const XMVECTOR clip = XMVector3Transform(world, view * proj);
+            const XMVECTOR ndc = clip / XMVectorGetW(clip);
+            return {
+                (XMVectorGetX(ndc) * 0.5f + 0.5f) * static_cast<float>(width_),
+                (1.0f - (XMVectorGetY(ndc) * 0.5f + 0.5f)) * static_cast<float>(height_)
+            };
+        }
+
+        dx12xpbd::Vec3 ScreenToGround(int x, int y) const
+        {
+            const float ndcX = (2.0f * x / width_) - 1.0f;
+            const float ndcY = 1.0f - (2.0f * y / height_);
+            const float aspect = width_ / static_cast<float>(height_);
+            const float fov = XM_PIDIV4;
+            const float tanHalfFov = std::tan(fov * 0.5f);
+
+            XMFLOAT3 camPos(cameraPosition_.x, cameraPosition_.y, cameraPosition_.z);
+            XMFLOAT3 camTarget(cameraTarget_.x, cameraTarget_.y, cameraTarget_.z);
+            XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&camTarget) - XMLoadFloat3(&camPos));
+            XMVECTOR right = XMVector3Normalize(XMVector3Cross(forward, XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f)));
+            XMVECTOR up = XMVector3Cross(right, forward);
+
+            const XMVECTOR rayDir = XMVector3Normalize(
+                forward +
+                right * (ndcX * aspect * tanHalfFov) +
+                up * (ndcY * tanHalfFov));
+
+            XMFLOAT3 dir;
+            XMStoreFloat3(&dir, rayDir);
+
+            const float t = -cameraPosition_.y / dir.y;
+            return {
+                cameraPosition_.x + dir.x * t,
+                0.0f,
+                cameraPosition_.z + dir.z * t
+            };
+        }
+
+        void Render()
+        {
+            frameIndex_ = swapChain_->GetCurrentBackBufferIndex();
+            commandAllocator_[frameIndex_]->Reset();
+            commandList_->Reset(commandAllocator_[frameIndex_].Get(), nullptr);
 
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = renderTargets[frameIndex].Get();
+            barrier.Transition.pResource = renderTargets_[frameIndex_].Get();
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            commandList->ResourceBarrier(1, &barrier);
+            commandList_->ResourceBarrier(1, &barrier);
 
-            auto rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
-            rtv.ptr += frameIndex * rtvDescriptorSize;
-            commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            const float clearColor[4] = {0.07f, 0.08f, 0.12f, 1.0f};
-            commandList->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
-            commandList->SetPipelineState(pipelineState.Get());
-            commandList->SetGraphicsRootSignature(rootSignature.Get());
-            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
-            commandList->DrawInstanced(vertexCount, 1, 0, 0);
+            CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(rtvHeap_->GetCPUDescriptorHandleForHeapStart(), frameIndex_, rtvDescriptorSize_);
+            commandList_->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+            const float clearColor[4] = {0.05f, 0.06f, 0.10f, 1.0f};
+            commandList_->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+            XMFLOAT4X4 world, view, proj;
+            XMStoreFloat4x4(&world, XMMatrixIdentity());
+            XMStoreFloat4x4(&view, XMMatrixLookAtLH(XMLoadFloat3(&cameraPosition_), XMLoadFloat3(&cameraTarget_), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f)));
+            XMStoreFloat4x4(&proj, XMMatrixPerspectiveFovLH(XM_PIDIV4, width_ / static_cast<float>(height_), 0.1f, 100.0f));
+
+            SceneConstants scene = {world, view, proj};
+            memcpy(cbMapped_, &scene, sizeof(scene));
+
+            commandList_->SetPipelineState(pipelineState_.Get());
+            commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+            commandList_->SetGraphicsRootConstantBufferView(0, constantBuffer_->GetGPUVirtualAddress());
+            commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            commandList_->IASetVertexBuffers(0, 1, &vertexBufferView_);
+            commandList_->IASetIndexBuffer(&indexBufferView_);
+            commandList_->DrawIndexedInstanced(static_cast<UINT>(cloth_.Triangles().size() * 3), 1, 0, 0, 0);
 
             barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
             barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-            commandList->ResourceBarrier(1, &barrier);
-            commandList->Close();
+            commandList_->ResourceBarrier(1, &barrier);
+            commandList_->Close();
 
-            ID3D12CommandList* lists[] = { commandList.Get() };
-            commandQueue->ExecuteCommandLists(_countof(lists), lists);
-            swapChain->Present(1, 0);
+            ID3D12CommandList* pList = commandList_.Get();
+            commandQueue_->ExecuteCommandLists(1, &pList);
+            swapChain_->Present(1, 0);
+
+            UINT64 signalValue = ++fenceValue_;
+            commandQueue_->Signal(fence_.Get(), signalValue);
+            if (fence_->GetCompletedValue() < signalValue)
+            {
+                fence_->SetEventOnCompletion(signalValue, nullptr);
+            }
         }
     };
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int)
 {
-    switch (message)
+    try
     {
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    default:
-        return DefWindowProc(hwnd, message, wParam, lParam);
+        ClothDemoApp app;
+        app.Initialize(hInstance, 1280, 720);
+        app.Run();
     }
-}
-
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
-{
-    DX12ClothDemo app;
-    app.Initialize(hInstance, 1280, 720);
-
-    MSG msg = {};
-    while (true)
+    catch (const std::exception& e)
     {
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
-        {
-            if (msg.message == WM_QUIT)
-                return 0;
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-
-        app.UpdatePhysics(1.0f / 60.0f);
-        app.RenderFrame();
+        OutputDebugStringA(e.what());
+        return 1;
     }
 
     return 0;
